@@ -26,6 +26,10 @@ ESP32_IP = os.getenv('ESP32_IP', '10.70.55.222')
 DISCORD_CHANNEL_ID = int(os.getenv('DISCORD_CHANNEL_ID', 1406180111358885928))
 DISCORD_TOKEN = os.getenv('DISCORD_TOKEN')
 HEARTBEAT_INTERVAL = int(os.getenv('HEARTBEAT_INTERVAL', 1))
+# ชื่อ role (หรือ 'admin'/'manage_guild' permission) ที่อนุญาตให้สั่งควบคุมระบบได้
+CONTROL_ROLE = os.getenv('CONTROL_ROLE', 'Admin')
+# Token ที่ใช้ยืนยันตัวตนกับ ESP32 (ฝั่ง firmware ต้องตรวจสอบ header นี้ด้วย)
+ESP32_TOKEN = os.getenv('ESP32_TOKEN', '')
 
 if not DISCORD_TOKEN:
     raise ValueError("DISCORD_TOKEN ไม่พบในไฟล์ .env")
@@ -39,6 +43,34 @@ bot = commands.Bot(
     help_command=None
 )
 
+def esp32_headers():
+    """Header สำหรับยืนยันตัวตนกับ ESP32 (ถ้ามีการตั้ง ESP32_TOKEN)."""
+    return {'X-Auth-Token': ESP32_TOKEN} if ESP32_TOKEN else {}
+
+def can_control(ctx):
+    """อนุญาตเฉพาะเจ้าของบอท / ผู้ที่มี permission ดูแล server / ผู้มี role CONTROL_ROLE."""
+    if not isinstance(ctx.author, discord.Member):
+        return False
+    if ctx.author.id == ctx.bot.owner_id:
+        return True
+    perms = ctx.author.guild_permissions
+    if perms.administrator or perms.manage_guild:
+        return True
+    return any(role.name.lower() == CONTROL_ROLE.lower() for role in ctx.author.roles)
+
+def require_control():
+    """Decorator: ปฏิเสธผู้ใช้ที่ไม่มีสิทธิ์ควบคุมระบบ."""
+    async def predicate(ctx):
+        if can_control(ctx):
+            return True
+        await ctx.send(embed=create_embed(
+            "⛔ ไม่อนุญาต",
+            f"คุณต้องมี role '{CONTROL_ROLE}' หรือสิทธิ์ดูแล server ถึงจะใช้คำสั่งนี้ได้",
+            0xFF0000,
+        ))
+        return False
+    return commands.check(predicate)
+
 class ESP32ConnectionError(Exception):
     """Custom exception สำหรับ ESP32"""
     pass
@@ -50,7 +82,7 @@ async def check_esp32_connection():
     """ตรวจสอบการเชื่อมต่อ ESP32"""
     async with await get_session() as session:
         try:
-            async with session.get(f"http://{ESP32_IP}/ping") as response:
+            async with session.get(f"http://{ESP32_IP}/ping", headers=esp32_headers()) as response:
                 if response.status != 200:
                     text = await response.text()
                     raise ESP32ConnectionError(f"HTTP {response.status}: {text[:100]}")
@@ -62,7 +94,7 @@ async def get_esp32_status():
     """ดึงสถานะจาก ESP32"""
     async with await get_session() as session:
         try:
-            async with session.get(f"http://{ESP32_IP}/status", timeout=10) as response:
+            async with session.get(f"http://{ESP32_IP}/status", timeout=10, headers=esp32_headers()) as response:
                 if response.status != 200:
                     text = await response.text()
                     raise ESP32ConnectionError(f"HTTP {response.status}: {text[:100]}")
@@ -124,11 +156,12 @@ async def ping(ctx):
     await ctx.send(embed=embed)
 
 @bot.command()
+@require_control()
 async def on(ctx):
     """เปิดระบบควบคุมอัตโนมัติ"""
     try:
         async with await get_session() as session:
-            async with session.get(f"http://{ESP32_IP}/command?cmd=on") as response:
+            async with session.get(f"http://{ESP32_IP}/command?cmd=on", headers=esp32_headers()) as response:
                 if response.status != 200:
                     raise ESP32ConnectionError("ไม่สามารถเปิดระบบได้")
                 data = await response.json()
@@ -142,11 +175,12 @@ async def on(ctx):
     await ctx.send(embed=embed)
 
 @bot.command()
+@require_control()
 async def off(ctx):
     """ปิดระบบควบคุมอัตโนมัติ"""
     try:
         async with await get_session() as session:
-            async with session.get(f"http://{ESP32_IP}/command?cmd=off") as response:
+            async with session.get(f"http://{ESP32_IP}/command?cmd=off", headers=esp32_headers()) as response:
                 if response.status != 200:
                     raise ESP32ConnectionError("ไม่สามารถปิดระบบได้")
                 data = await response.json()
@@ -177,6 +211,7 @@ async def status(ctx):
     await ctx.send(embed=embed)
 
 @bot.command()
+@require_control()
 async def pump(ctx, action: str = None):
     """ควบคุมปั๊มด้วยมือ: /pump on หรือ /pump off"""
     if action is None:
@@ -192,7 +227,7 @@ async def pump(ctx, action: str = None):
     command = f"pump_{action.lower()}"
     try:
         async with await get_session() as session:
-            async with session.get(f"http://{ESP32_IP}/command?cmd={command}") as response:
+            async with session.get(f"http://{ESP32_IP}/command?cmd={command}", headers=esp32_headers()) as response:
                 if response.status != 200:
                     raise ESP32ConnectionError("ไม่สามารถควบคุมปั๊มได้")
                 data = await response.json()
@@ -210,6 +245,7 @@ async def pump(ctx, action: str = None):
     await ctx.send(embed=embed)
 
 @bot.command()
+@require_control()
 async def reboot(ctx):
     """รีสตาร์ท ESP32"""
     try:
@@ -217,7 +253,7 @@ async def reboot(ctx):
         await ctx.send(embed=embed)
         
         async with await get_session() as session:
-            async with session.get(f"http://{ESP32_IP}/command?cmd=reboot", timeout=5) as response:
+            async with session.get(f"http://{ESP32_IP}/command?cmd=reboot", timeout=5, headers=esp32_headers()) as response:
                 pass  # ไม่ต้องรอ response
         
         await asyncio.sleep(3)
